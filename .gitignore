@@ -1,0 +1,33 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environment and local config
+.env
+.env.*
+
+# Logs
+*.log
+logs/
+
+# Local datasets and generated artifacts
+data/raw/
+data/interim/
+data/processed/
+data/external/
+models/
+artifacts/
+
