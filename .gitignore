@@ -28,6 +28,5 @@ data/raw/
 data/interim/
 data/processed/
 data/external/
-models/
-artifacts/
-
+/models/
+/artifacts/
