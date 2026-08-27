@@ -11,6 +11,7 @@ DEFAULT_OUTPUT_DIR = Path("data/processed")
 POSITIVE_RATING_THRESHOLD = 4.0
 TRAIN_FRAC = 0.80
 VAL_FRAC = 0.10
+MIN_INTERACTIONS_PER_USER = 10
 
 
 def parse_args() -> argparse.Namespace:
@@ -35,6 +36,15 @@ def parse_args() -> argparse.Namespace:
         default=POSITIVE_RATING_THRESHOLD,
         help="Ratings greater than or equal to this value are labeled positive.",
     )
+    parser.add_argument(
+        "--min-interactions-per-user",
+        type=int,
+        default=MIN_INTERACTIONS_PER_USER,
+        help=(
+            "Minimum user history needed for per-user train/val/test splitting. "
+            "Users below this threshold stay entirely in train."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -57,10 +67,11 @@ def add_rating_label(
     return labeled
 
 
-def temporal_train_val_test_split(
+def per_user_temporal_train_val_test_split(
     ratings: pd.DataFrame,
     train_frac: float = TRAIN_FRAC,
     val_frac: float = VAL_FRAC,
+    min_interactions_per_user: int = MIN_INTERACTIONS_PER_USER,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     if not 0 < train_frac < 1:
         raise ValueError("train_frac must be between 0 and 1.")
@@ -68,36 +79,62 @@ def temporal_train_val_test_split(
         raise ValueError("val_frac must be between 0 and 1.")
     if train_frac + val_frac >= 1:
         raise ValueError("train_frac + val_frac must be less than 1.")
+    if min_interactions_per_user < 10:
+        raise ValueError("min_interactions_per_user must be at least 10.")
 
     sorted_ratings = ratings.sort_values(
-        by=["timestamp", "userId", "movieId"],
+        by=["userId", "timestamp", "movieId"],
         kind="mergesort",
     ).reset_index(drop=True)
 
-    n_ratings = len(sorted_ratings)
-    train_end = int(n_ratings * train_frac)
-    val_end = train_end + int(n_ratings * val_frac)
+    grouped = sorted_ratings.groupby("userId", sort=False)
+    user_interaction_counts = grouped["movieId"].transform("size")
+    user_positions = grouped.cumcount()
 
-    train = sorted_ratings.iloc[:train_end].copy()
-    val = sorted_ratings.iloc[train_end:val_end].copy()
-    test = sorted_ratings.iloc[val_end:].copy()
+    eligible_users = user_interaction_counts.ge(min_interactions_per_user)
+    train_counts = (user_interaction_counts * train_frac).astype("int64")
+    val_counts = (user_interaction_counts * val_frac).astype("int64").clip(lower=1)
+    val_ends = train_counts + val_counts
 
-    validate_temporal_order(train, val, test)
+    # Users with too little history stay in train and are excluded from eval.
+    train_mask = ~eligible_users | user_positions.lt(train_counts)
+    val_mask = eligible_users & user_positions.ge(train_counts) & user_positions.lt(val_ends)
+    test_mask = eligible_users & user_positions.ge(val_ends)
+
+    train = sorted_ratings.loc[train_mask].copy()
+    val = sorted_ratings.loc[val_mask].copy()
+    test = sorted_ratings.loc[test_mask].copy()
+
+    validate_per_user_temporal_order(train, val, test)
 
     return train, val, test
 
 
-def validate_temporal_order(
+def validate_per_user_temporal_order(
     train: pd.DataFrame, val: pd.DataFrame, test: pd.DataFrame
 ) -> None:
     if train.empty or val.empty or test.empty:
         raise ValueError("Each split must contain at least one row.")
 
-    if train["timestamp"].max() > val["timestamp"].min():
-        raise ValueError("Temporal leakage detected: train contains validation future data.")
+    train_users = set(train["userId"].unique())
+    val_users = set(val["userId"].unique())
+    test_users = set(test["userId"].unique())
 
-    if val["timestamp"].max() > test["timestamp"].min():
-        raise ValueError("Temporal leakage detected: validation contains test future data.")
+    if not val_users.issubset(train_users):
+        raise ValueError("Validation contains users with no training history.")
+    if not test_users.issubset(train_users):
+        raise ValueError("Test contains users with no training history.")
+
+    train_max_timestamp = train.groupby("userId")["timestamp"].max()
+    val_min_timestamp = val.groupby("userId")["timestamp"].min()
+    val_max_timestamp = val.groupby("userId")["timestamp"].max()
+    test_min_timestamp = test.groupby("userId")["timestamp"].min()
+
+    if (train_max_timestamp.loc[list(val_users)] > val_min_timestamp).any():
+        raise ValueError("Temporal leakage detected between train and validation.")
+
+    if (val_max_timestamp.loc[list(test_users)] > test_min_timestamp).any():
+        raise ValueError("Temporal leakage detected between validation and test.")
 
 
 def save_splits(
@@ -123,12 +160,17 @@ def main() -> None:
         ratings=ratings,
         positive_threshold=args.positive_threshold,
     )
-    train, val, test = temporal_train_val_test_split(labeled_ratings)
+    train, val, test = per_user_temporal_train_val_test_split(
+        labeled_ratings,
+        min_interactions_per_user=args.min_interactions_per_user,
+    )
     save_splits(train, val, test, args.output_dir)
 
     print(f"Saved {len(train):,} rows to {args.output_dir / 'train.csv'}")
     print(f"Saved {len(val):,} rows to {args.output_dir / 'val.csv'}")
     print(f"Saved {len(test):,} rows to {args.output_dir / 'test.csv'}")
+    print(f"Validation users: {val['userId'].nunique():,}")
+    print(f"Test users: {test['userId'].nunique():,}")
 
 
 if __name__ == "__main__":
